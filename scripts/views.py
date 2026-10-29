@@ -51,7 +51,7 @@ def _collect(compound, deflection=0.08):
     return out
 
 
-def hlr_view(shape, direction, up, deflection=0.08):
+def hlr_view(shape, direction, up, deflection=0.08, with_hidden=True):
     """
     Вид вдоль direction (от наблюдателя), 'up' - вертикаль вида.
     Возвращает (visible_polylines, hidden_polylines) в координатах вида.
@@ -86,14 +86,11 @@ def hlr_view(shape, direction, up, deflection=0.08):
         vis += _collect(toshape.Rg1LineVCompound(), deflection)
     except Exception:
         pass
-    try:
-        hid += _collect(toshape.HCompound(), deflection)
-    except Exception:
-        pass
-    try:
-        hid += _collect(toshape.OutLineHCompound(), deflection)
-    except Exception:
-        pass
+    if with_hidden:
+        try:
+            hid += _collect(toshape.HCompound(), deflection)
+        except Exception:
+            pass
     return vis, hid
 
 

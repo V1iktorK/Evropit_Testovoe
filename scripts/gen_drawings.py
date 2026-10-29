@@ -306,6 +306,30 @@ def make_part_drawing(name, shape):
                            else f"Ø{big_hole['d']:g}")
         sheet.text((ax0 + 5, ay0 + 68), 'Отверстия: ' + '; '.join(note[:8]), size=3.2, col='note')
 
+        # центровые оси и размеры положения отверстий
+        centers_all = []
+        for hg in holes:
+            for c in hg['centers']:
+                centers_all.append((c[AXI[h_ax]] * s + tx, c[AXI[v_ax]] * s + ty, hg['d'] / 2 * s))
+        for (cx_, cy_, r_) in centers_all:
+            m = max(r_ + 1.5, 2.0)
+            sheet.line((cx_ - m, cy_), (cx_ + m, cy_), col='center', lw='hair', dash='center')
+            sheet.line((cx_, cy_ - m), (cx_, cy_ + m), col='center', lw='hair', dash='center')
+        # цепочки размеров по строкам (одинаковые y)
+        rows_y = {}
+        for (cx_, cy_, r_) in centers_all:
+            key = round(cy_, 0)
+            rows_y.setdefault(key, []).append(cx_)
+        for ri, (key, xs) in enumerate(sorted(rows_y.items())):
+            xs = sorted(xs)
+            if len(xs) < 2:
+                continue
+            off = -20 - ri * 11
+            for a, b in zip(xs, xs[1:]):
+                sheet.dim_linear((a, key), (b, key), off, text=fmt((b - a) / s))
+            # размер от левого края вида до первого отверстия
+            sheet.dim_linear((x0, key), (xs[0], key), off, text=fmt((xs[0] - x0) / s))
+
     # ---- технические требования ----
     yy = ay0 + 58
     sheet.text((ax0 + 5, yy), 'Технические требования:', size=3.5, col='text')
@@ -336,11 +360,11 @@ def make_asm_drawing(st, name):
     per_col = (n + ncols - 1) // ncols
     table_h = per_col * row_h + 16
 
-    v, h = hlr_view(shape, (0, -1, 0), (0, 0, 1))
-    v2, h2 = hlr_view(shape, (1, 0, 0), (0, 0, 1))
+    v, h = hlr_view(shape, (0, -1, 0), (0, 0, 1), with_hidden=False)
+    v2, h2 = hlr_view(shape, (1, 0, 0), (0, 0, 1), with_hidden=False)
     hv, vv, dv = (1, 0, 0), (0, 1, 0), (0, 0, 1)
     iso_dir = tuple(-(0.8 * hv[i] + 1.0 * dv[i] + 0.62 * vv[i]) for i in range(3))
-    iso_v, _ = hlr_view(shape, iso_dir, vv)
+    iso_v, _ = hlr_view(shape, iso_dir, vv, with_hidden=False)
     bb1, bb2, bbi = bbox2d(v), bbox2d(v2), bbox2d(iso_v)
     gap = 20
     w1, h1 = bb1[2] - bb1[0], bb1[3] - bb1[1]
@@ -415,46 +439,50 @@ def make_asm_drawing(st, name):
 
 # ------------------------------------------------------------------ main
 def main():
+    parts_only = '--parts-only' in sys.argv
+    assemblies_only = '--assemblies-only' in sys.argv
     st, root = load_step()
     walk_collect(st, root)
     print(f"shapes collected: {len(SHAPES)}")
 
     errors = []
     # ---- детали ----
-    parts = [n for n in sorted(D.TOTALS) if D.is_custom(n) and not D.is_purchased(n) and n not in D.TREE]
-    for name in parts:
-        try:
-            sh = SHAPES.get(name)
-            if sh is None:
-                errors.append((name, 'нет геометрии'))
-                continue
-            t0 = time.time()
-            sheet = make_part_drawing(name, sh)
-            if sheet is None:
-                errors.append((name, 'нет геометрии'))
-                continue
-            sheet.save_dxf(os.path.join(OUT_DXF, f"{name}.dxf"))
-            sheet.save_pdf(os.path.join(OUT_PDF, f"{name}.pdf"))
-            print(f"OK  {name}  ({time.time()-t0:.1f}s)")
-        except Exception as e:
-            errors.append((name, str(e)))
-            print(f"ERR {name}: {e}")
-            traceback.print_exc()
+    if not assemblies_only:
+        parts = [n for n in sorted(D.TOTALS) if D.is_custom(n) and not D.is_purchased(n) and n not in D.TREE]
+        for name in parts:
+            try:
+                sh = SHAPES.get(name)
+                if sh is None:
+                    errors.append((name, 'нет геометрии'))
+                    continue
+                t0 = time.time()
+                sheet = make_part_drawing(name, sh)
+                if sheet is None:
+                    errors.append((name, 'нет геометрии'))
+                    continue
+                sheet.save_dxf(os.path.join(OUT_DXF, f"{name}.dxf"))
+                sheet.save_pdf(os.path.join(OUT_PDF, f"{name}.pdf"))
+                print(f"OK  {name}  ({time.time()-t0:.1f}s)")
+            except Exception as e:
+                errors.append((name, str(e)))
+                print(f"ERR {name}: {e}")
+                traceback.print_exc()
 
     # ---- сборки ----
-    assemblies = [n for n in D.TREE if n.startswith('PSH24-') or n.startswith('PSH20-')]
-    for name in assemblies:
-        try:
-            t0 = time.time()
-            sheet = make_asm_drawing(st, name)
-            pref = 'ASM_'
-            sheet.save_dxf(os.path.join(OUT_DXF, f"{pref}{name}.dxf"))
-            sheet.save_pdf(os.path.join(OUT_PDF, f"{pref}{name}.pdf"))
-            print(f"OK  {pref}{name}  ({time.time()-t0:.1f}s)")
-        except Exception as e:
-            errors.append((name, str(e)))
-            print(f"ERR {name}: {e}")
-            traceback.print_exc()
+    if not parts_only:
+        assemblies = [n for n in D.TREE if n.startswith('PSH24-') or n.startswith('PSH20-')]
+        for name in assemblies:
+            try:
+                t0 = time.time()
+                sheet = make_asm_drawing(st, name)
+                pref = 'ASM_'
+                sheet.save_dxf(os.path.join(OUT_DXF, f"{pref}{name}.dxf"))
+                sheet.save_pdf(os.path.join(OUT_PDF, f"{pref}{name}.pdf"))
+                print(f"OK  {pref}{name}  ({time.time()-t0:.1f}s)")
+            except Exception as e:
+                errors.append((name, str(e)))
+                print(f"ERR {name}: {e}")
+                traceback.print_exc()
 
     print(f"done. errors: {len(errors)}")
     for n, e in errors:

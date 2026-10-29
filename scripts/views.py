@@ -91,6 +91,10 @@ def hlr_view(shape, direction, up, deflection=0.08, with_hidden=True):
             hid += _collect(toshape.HCompound(), deflection)
         except Exception:
             pass
+    # HLR возвращает координаты в базисе проектора, где ось Y = d x right = -up;
+    # приводим к виду «вверх = up» (согласовано с view_project)
+    vis = [[(x, -y) for (x, y) in pl] for pl in vis]
+    hid = [[(x, -y) for (x, y) in pl] for pl in hid]
     return vis, hid
 
 
@@ -103,3 +107,20 @@ def bbox2d(polys):
     if not xs:
         return (0, 0, 0, 0)
     return (min(xs), min(ys), max(xs), max(ys))
+
+
+def view_project(p, direction, up):
+    """Проекция 3D-точки в координаты вида (согласовано с hlr_view)."""
+    d = direction
+    L = math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2) or 1.0
+    d = (d[0] / L, d[1] / L, d[2] / L)
+    u = [up[0], up[1], up[2]]
+    dd = u[0] * d[0] + u[1] * d[1] + u[2] * d[2]
+    u = [u[i] - dd * d[i] for i in range(3)]
+    un = math.sqrt(u[0] ** 2 + u[1] ** 2 + u[2] ** 2) or 1.0
+    u = (u[0] / un, u[1] / un, u[2] / un)
+    right = (d[1] * u[2] - d[2] * u[1],
+             d[2] * u[0] - d[0] * u[2],
+             d[0] * u[1] - d[1] * u[0])
+    return (p[0] * right[0] + p[1] * right[1] + p[2] * right[2],
+            p[0] * u[0] + p[1] * u[1] + p[2] * u[2])

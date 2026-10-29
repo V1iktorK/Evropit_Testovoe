@@ -84,7 +84,7 @@ for depth, name, qty in spec_rows(ROOT):
         ('    ' * depth) + f"{name} — {D.part_name(name)}",
         kind, qty,
         D.part_material_ru(name),
-        round(mass, 2), round(mass * qty, 2),
+        round(mass, 4), round(mass * qty, 2),
         D.analog(name) if D.is_purchased(name) else 'Изготовить по КД PSH24',
         'входит в сборку' if is_asm else ('покупное изделие' if D.is_purchased(name) else kind_ru(D.part_kind(name))),
     ], GRP_FILL if is_asm else None)

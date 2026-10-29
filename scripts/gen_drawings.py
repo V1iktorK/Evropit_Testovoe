@@ -8,7 +8,7 @@ import os, sys, math, time, traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import data as D
 from sheetlib import Sheet, pick_scale
-from views import hlr_view, bbox2d
+from views import hlr_view, bbox2d, view_project
 
 from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.TDocStd import TDocStd_Document
@@ -110,6 +110,28 @@ def component_centers(st, asm_label):
         if nm not in out:
             out[nm] = c
     return out
+
+def filtered_shape(st, asm_label, max_mass_kg=0.25):
+    """Облегчённая копия сборки для HLR: без мелкого крепежа (гайки/шайбы).
+    Существенно снижает расход памяти при построении скрытых линий."""
+    from OCP.BRep import BRep_Builder
+    from OCP.TopoDS import TopoDS_Compound
+    from OCP.TDF import TDF_LabelSequence, TDF_Label
+    builder = BRep_Builder()
+    comp = TopoDS_Compound()
+    builder.MakeCompound(comp)
+    comps = TDF_LabelSequence()
+    st.GetComponents_s(asm_label, comps)
+    for i in range(1, comps.Length() + 1):
+        lab = comps.Value(i)
+        ref = TDF_Label()
+        is_ref = st.GetReferredShape_s(lab, ref)
+        target = ref if (is_ref and not ref.IsNull()) else lab
+        nm = D.canonical(label_name(target) or label_name(lab))
+        if D.is_purchased(nm) and D.part_mass_kg(nm) < max_mass_kg:
+            continue  # мелкий крепёж не показываем
+        builder.Add(comp, st.GetShape_s(lab))
+    return comp
 
 # ------------------------------------------------------------------ отверстия
 def hole_groups(shape):
@@ -297,8 +319,7 @@ def make_part_drawing(name, shape):
     if holes:
         big_hole = max(holes, key=lambda hg: hg['d'])
         c = big_hole['centers'][0]
-        vx = c[AXI[h_ax]]
-        vy = c[AXI[v_ax]]
+        vx, vy = view_project(c, AXV[d_ax], AXV[v_ax])
         px = vx * s + tx
         py = vy * s + ty
         sheet.dim_diameter((px, py), big_hole['d'] / 2 * s, 55,
@@ -310,17 +331,20 @@ def make_part_drawing(name, shape):
         centers_all = []
         for hg in holes:
             for c in hg['centers']:
-                centers_all.append((c[AXI[h_ax]] * s + tx, c[AXI[v_ax]] * s + ty, hg['d'] / 2 * s))
+                vx, vy = view_project(c, AXV[d_ax], AXV[v_ax])
+                centers_all.append((vx * s + tx, vy * s + ty, hg['d'] / 2 * s))
         for (cx_, cy_, r_) in centers_all:
             m = max(r_ + 1.5, 2.0)
             sheet.line((cx_ - m, cy_), (cx_ + m, cy_), col='center', lw='hair', dash='center')
             sheet.line((cx_, cy_ - m), (cx_, cy_ + m), col='center', lw='hair', dash='center')
-        # цепочки размеров по строкам (одинаковые y)
+        # цепочки размеров по строкам (одинаковые y) — только 2 основных ряда,
+        # чтобы не перегружать чертёж
         rows_y = {}
         for (cx_, cy_, r_) in centers_all:
             key = round(cy_, 0)
             rows_y.setdefault(key, []).append(cx_)
-        for ri, (key, xs) in enumerate(sorted(rows_y.items())):
+        rows_sorted = sorted(rows_y.items(), key=lambda kv: -len(kv[1]))[:2]
+        for ri, (key, xs) in enumerate(sorted(rows_sorted, key=lambda kv: kv[0])):
             xs = sorted(xs)
             if len(xs) < 2:
                 continue
@@ -338,8 +362,16 @@ def make_part_drawing(name, shape):
     return sheet
 
 # ------------------------------------------------------------------ сборочный чертёж
+def total_instances(name):
+    kids = D.TREE.get(name, {})
+    if not kids:
+        return 1
+    return sum(q * total_instances(ch) for ch, q in kids.items())
+
 def make_asm_drawing(st, name):
     shape = SHAPES[name]
+    # для крупных сборок HLR строим по облегчённой копии (без мелкого крепежа)
+    hlr_shape = filtered_shape(st, ASM_LABELS[name]) if total_instances(name) > 400 else shape
     sheet = Sheet('A2', True, designation=name, name=D.part_name(name),
                   material='—', mass=f"{D.part_mass_kg(name):.1f} кг", scale_text='')
     ax0, ay0, ax1, ay1 = sheet.frame_inner
@@ -360,11 +392,11 @@ def make_asm_drawing(st, name):
     per_col = (n + ncols - 1) // ncols
     table_h = per_col * row_h + 16
 
-    v, h = hlr_view(shape, (0, -1, 0), (0, 0, 1), with_hidden=False)
-    v2, h2 = hlr_view(shape, (1, 0, 0), (0, 0, 1), with_hidden=False)
+    v, h = hlr_view(hlr_shape, (0, -1, 0), (0, 0, 1), with_hidden=False)
+    v2, h2 = hlr_view(hlr_shape, (1, 0, 0), (0, 0, 1), with_hidden=False)
     hv, vv, dv = (1, 0, 0), (0, 1, 0), (0, 0, 1)
     iso_dir = tuple(-(0.8 * hv[i] + 1.0 * dv[i] + 0.62 * vv[i]) for i in range(3))
-    iso_v, _ = hlr_view(shape, iso_dir, vv, with_hidden=False)
+    iso_v, _ = hlr_view(hlr_shape, iso_dir, vv, with_hidden=False)
     bb1, bb2, bbi = bbox2d(v), bbox2d(v2), bbox2d(iso_v)
     gap = 20
     w1, h1 = bb1[2] - bb1[0], bb1[3] - bb1[1]
@@ -394,7 +426,7 @@ def make_asm_drawing(st, name):
     # позиции на главном виде — радиально от центра вида, со сдвигом
     cx_view, cy_view = (bb1[0] + bb1[2]) / 2 * s + ox, (bb1[1] + bb1[3]) / 2 * s + oy1
     for k, (i, ch, q, c) in enumerate(pos_list):
-        vx, vy = c[0], c[2]   # главный вид: dir=y -> координаты (x, z)
+        vx, vy = view_project(c, (0, -1, 0), (0, 0, 1))  # главный вид
         px, py = vx * s + ox, vy * s + oy1
         dx_, dy_ = px - cx_view, py - cy_view
         L = math.hypot(dx_, dy_) or 1.0
@@ -468,9 +500,10 @@ def main():
                 print(f"ERR {name}: {e}")
                 traceback.print_exc()
 
-    # ---- сборки ----
+    # ---- сборки ---- (крупные первыми — HLR на корневой сборке требует много памяти)
     if not parts_only:
-        assemblies = [n for n in D.TREE if n.startswith('PSH24-') or n.startswith('PSH20-')]
+        assemblies = sorted((n for n in D.TREE if n.startswith('PSH24-') or n.startswith('PSH20-')),
+                            key=lambda n: -total_instances(n))
         for name in assemblies:
             try:
                 t0 = time.time()
@@ -479,6 +512,9 @@ def main():
                 sheet.save_dxf(os.path.join(OUT_DXF, f"{pref}{name}.dxf"))
                 sheet.save_pdf(os.path.join(OUT_PDF, f"{pref}{name}.pdf"))
                 print(f"OK  {pref}{name}  ({time.time()-t0:.1f}s)")
+                del sheet
+                import gc
+                gc.collect()
             except Exception as e:
                 errors.append((name, str(e)))
                 print(f"ERR {name}: {e}")

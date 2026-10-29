@@ -161,25 +161,39 @@ def classify_part(name):
 
     # --- стержни, трубы, профили (вытянутые) ---
     if elong > 3:
+        t_est = sheet_thickness_est(name)
         # плоская полоса (лист/полоса) — при малой толщине относительно ширины
         if th <= 12 and th / mid <= 0.2:
             if mat == 'Rubber':
                 return 'plate', f"Полоса резиновая {fmt_num(mid)}×{fmt_num(th)}, L={fmt_num(big)}"
             return 'plate', f"Полоса {fmt_num(mid)}×{fmt_num(th)}, L={fmt_num(big)}"
-        if abs(mid - th) / mid < 0.12:
-            d = mid
-            Around = math.pi / 4 * d * d
-            if A_mm2 > 0.92 * Around:
-                return 'shaft', f"Стержень ⌀{fmt_num(d)}, L={fmt_num(big)}"
-            s = (d - math.sqrt(max(d * d - 4 * A_mm2 / math.pi, 0.0))) / 2
-            return 'tube', f"Труба ⌀{fmt_num(d)}×{fmt_num(s,1)}, L={fmt_num(big)}"
-        Arect = mid * th
-        if A_mm2 > 0.92 * Arect:
-            return 'profile', f"Профиль сплошной {fmt_num(mid)}×{fmt_num(th)}, L={fmt_num(big)}"
-        s = ((mid + th) - math.sqrt(max((mid + th) ** 2 - 4 * A_mm2, 0.0))) / 4
-        if mat in ('Rubber',):
+        # резиновые гибкие полотна/профили
+        if mat == 'Rubber' and t_est <= 8 and th > 3 * t_est:
+            return 'bent', f"Полотно гибкое (резина), s={fmt_num(t_est)}"
+        is_round = abs(mid - th) / mid < 0.12
+        perim = math.pi * mid if is_round else 2.0 * (mid + th)
+        A_pred = perim * t_est
+        closed = abs(A_mm2 - A_pred) <= 0.35 * max(A_pred, 1.0)
+        if closed:
+            if is_round:
+                d = mid
+                Around = math.pi / 4 * d * d
+                if A_mm2 > 0.92 * Around:
+                    return 'shaft', f"Стержень ⌀{fmt_num(d)}, L={fmt_num(big)}"
+                s = (d - math.sqrt(max(d * d - 4 * A_mm2 / math.pi, 0.0))) / 2
+                return 'tube', f"Труба ⌀{fmt_num(d)}×{fmt_num(s,1)}, L={fmt_num(big)}"
+            Arect = mid * th
+            if A_mm2 > 0.92 * Arect:
+                return 'profile', f"Профиль сплошной {fmt_num(mid)}×{fmt_num(th)}, L={fmt_num(big)}"
+            s = ((mid + th) - math.sqrt(max((mid + th) ** 2 - 4 * A_mm2, 0.0))) / 4
+            return 'tube', f"Труба профильная {fmt_num(mid)}×{fmt_num(th)}×{fmt_num(s,1)}, L={fmt_num(big)}"
+        # незамкнутый тонкий профиль (гнутая панель)
+        if t_est <= 8 and th / mid > 0.25 and A_mm2 < 0.10 * mid * th:
+            pre = 'Полотно гибкое (резина)' if mat == 'Rubber' else 'Панель гнутая'
+            return 'bent', f"{pre}, s={fmt_num(t_est)}"
+        if mat == 'Rubber':
             return 'profile', f"Профиль резиновый {fmt_num(mid)}×{fmt_num(th)}, L={fmt_num(big)}"
-        return 'tube', f"Труба профильная {fmt_num(mid)}×{fmt_num(th)}×{fmt_num(s,1)}, L={fmt_num(big)}"
+        return 'other', f"Деталь {fmt_num(big)}×{fmt_num(mid)}×{fmt_num(th)}"
 
     # --- листовые плоские (min = толщина, объём ~ площадь*толщина) ---
     plate_area = V / (th / 10.0)  # см2
@@ -193,7 +207,9 @@ def classify_part(name):
         return 'plate', f"Пластина {fmt_num(big)}×{fmt_num(mid)}, s={fmt_num(th)}"
 
     # --- гнутые/формованные листовые панели (t оценивается как 2V/S) ---
-    if t_est <= 8 and plate_area > 1.05 * nominal and g['nfaces'] >= 8:
+    A_flat = g['volume'] / max(t_est, 0.1)          # площадь срединной поверхности
+    if (t_est <= 8 and th > 3 * t_est and g['nfaces'] >= 8
+            and A_flat >= 0.9 * mid * big):
         pre = 'Полотно гибкое (резина)' if mat == 'Rubber' else 'Панель гнутая'
         return 'bent', f"{pre}, s={fmt_num(t_est)}"
 

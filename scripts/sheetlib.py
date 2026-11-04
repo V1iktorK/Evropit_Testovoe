@@ -17,7 +17,7 @@ FORMATS = {
 }
 
 LW = {'thick': 0.7, 'thin': 0.35, 'extra': 1.0, 'hair': 0.25}
-COL = {'frame': 7, 'outline': 1, 'dim': 2, 'text': 3, 'center': 4, 'hidden': 5,
+COL = {'frame': 7, 'outline': 1, 'dim': 7, 'text': 3, 'center': 4, 'hidden': 5,
        'note': 6, 'thin': 8}
 
 
@@ -102,6 +102,10 @@ class Sheet:
         if off < 0:
             nx, ny = -nx, -ny
             off = -off
+        # малый размер (< 6 мм на листе): стрелки выносятся наружу
+        outer = L < 6.0
+        if outer:
+            ext = max(ext, 4.0)
         q1 = (p1[0] + nx * off, p1[1] + ny * off)
         q2 = (p2[0] + nx * off, p2[1] + ny * off)
         # выносные линии
@@ -110,8 +114,13 @@ class Sheet:
         self.line((p1[0] + nx * 1, p1[1] + ny * 1), e1, col=col, lw='thin')
         self.line((p2[0] + nx * 1, p2[1] + ny * 1), e2, col=col, lw='thin')
         self.line(q1, q2, col=col, lw='thin')
-        self._arrow(q1, (-ux, -uy), col=col)
-        self._arrow(q2, (ux, uy), col=col)
+        if outer:
+            # острия снаружи, обращены внутрь размера
+            self._arrow(q1, (ux, uy), col=col)
+            self._arrow(q2, (-ux, -uy), col=col)
+        else:
+            self._arrow(q1, (-ux, -uy), col=col)
+            self._arrow(q2, (ux, uy), col=col)
         if text is None:
             text = f"{L:.1f}".rstrip('0').rstrip('.') if L != int(round(L)) else f"{int(round(L))}"
         text = prefix + text
@@ -121,20 +130,26 @@ class Sheet:
             angle -= 180
         elif angle < -90:
             angle += 180
-        # текст над размерной линией
-        tx = mid[0] + nx * 2.0
-        ty = mid[1] + ny * 2.0
+        # ГОСТ 2.307: текст над горизонтальной размерной линией (сверху),
+        # слева от вертикальной (читается снизу вверх)
+        if abs(ux) >= abs(uy):
+            tx, ty = mid[0], mid[1] + 2.0
+        else:
+            tx, ty = mid[0] - 2.0, mid[1]
+            if angle < 0:
+                angle = -angle
         self.text((tx, ty), text, size=text_size, ha='center', va='center',
                   col=col, angle=angle)
 
     def dim_diameter(self, center, r, ang_deg, text=None, text_size=3.5,
-                     leader=12, col='dim', inside=False):
-        """Размер диаметра с полкой-выноской."""
+                     leader=12, col='dim', inside=False, shelf_dir=1):
+        """Размер диаметра с полкой-выноской. shelf_dir=+1 - полка вправо,
+        -1 - влево (текст справа/слева от точки полки)."""
         a = math.radians(ang_deg)
         p_on = (center[0] + r * math.cos(a), center[1] + r * math.sin(a))
         p_out = (center[0] + (r + leader) * math.cos(a),
                  center[1] + (r + leader) * math.sin(a))
-        shelf = 5
+        shelf = 5 * shelf_dir
         p_sh = (p_out[0] + shelf, p_out[1])
         self.line(p_on, p_out, col=col, lw='thin')
         self.line(p_out, p_sh, col=col, lw='thin')
@@ -142,10 +157,15 @@ class Sheet:
             d = 2 * r
             ds = f"{d:.1f}".rstrip('0').rstrip('.') if d != int(round(d)) else f"{int(round(d))}"
             text = f"⌀{ds}"
-        self.text((p_out[0] + 1, p_out[1] + 1.8), text, size=text_size,
-                  ha='left', va='center', col=col)
+        if shelf_dir > 0:
+            self.text((p_out[0] + 1, p_out[1] + 1.8), text, size=text_size,
+                      ha='left', va='center', col=col)
+        else:
+            self.text((p_out[0] - 1, p_out[1] + 1.8), text, size=text_size,
+                      ha='right', va='center', col=col)
         if not inside:
-            self._arrow(p_on, (math.cos(a), math.sin(a)), col=col)
+            # острие на окружности, обращено внутрь (от полки к окружности)
+            self._arrow(p_on, (-math.cos(a), -math.sin(a)), col=col)
 
     # ------------------------------------------------------------- frame
     def _draw_frame(self):
@@ -293,9 +313,9 @@ class Sheet:
         ax.set_ylim(0, self.h)
         ax.set_aspect('equal')
         ax.axis('off')
-        colors = {'frame': 'black', 'outline': 'black', 'dim': '#003366',
-                  'text': 'black', 'center': '#888888', 'hidden': '#888888',
-                  'note': 'black', 'thin': '#888888'}
+        colors = {'frame': 'black', 'outline': 'black', 'dim': 'black',
+                  'text': 'black', 'center': 'black', 'hidden': 'black',
+                  'note': 'black', 'thin': 'black'}
         lws = {'thick': 1.6, 'thin': 0.7, 'extra': 2.2, 'hair': 0.5}
         for kind, kw in self.ents:
             c = colors.get(kw.get('col', 'outline'), 'black')

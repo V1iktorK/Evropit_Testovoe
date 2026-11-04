@@ -3,11 +3,27 @@
 data.py — ядро данных проекта PSH24-000.00 (бункер):
 дерево сборки, количества, материалы (EN -> РФ), массы, наименования, аналоги.
 """
-import json, os, math, sys
+import json, os, math, sys, re
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 except Exception:
     pass
+
+# ---------------- декодирование STEP-имён \X2\hex\X0\ (UTF-16BE) ----------------
+_STEP_X2 = re.compile(r'\\X2\\([0-9A-Fa-f]+)\\X0\\')
+
+def decode_step(s):
+    r"""'\X2\04280430043904310430\X0\ DIN 127 - 7' -> 'Шайба DIN 127 - 7'."""
+    if not s or '\\X2\\' not in s:
+        return s
+
+    def _rep(m):
+        try:
+            return bytes.fromhex(m.group(1)).decode('utf-16-be')
+        except Exception:
+            return m.group(0)
+
+    return _STEP_X2.sub(_rep, s)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -17,11 +33,21 @@ with open(os.path.join(DATA, 'parts_geom.json'), encoding='utf-8') as f:
     GEOM = json.load(f)
 with open(os.path.join(DATA, 'part_materials.json'), encoding='utf-8') as f:
     _m = json.load(f)
-    MAT_EN = _m['material']
+    MAT_EN = {decode_step(k): v for k, v in _m['material'].items()}
 with open(os.path.join(DATA, 'step_tree.json'), encoding='utf-8') as f:
     _t = json.load(f)
     TREE = _t['tree']
     TOTALS = _t['totals']
+
+# нормализация имён: STEP-кодировки \X2\...\X0\ -> читаемый текст
+def _decode_tree(d):
+    out = {}
+    for k, v in d.items():
+        out[decode_step(k)] = {decode_step(c): q for c, q in v.items()}
+    return out
+
+TREE = _decode_tree(TREE)
+TOTALS = {decode_step(k): v for k, v in TOTALS.items()}
 
 DENSITY = {  # г/см3
     'S235': 7.85, 'S355': 7.85, 'S355JR': 7.85, 'S355J2G3': 7.85,
@@ -59,17 +85,16 @@ ALIAS = {
     'ISO 2341 - B - 16 x 100': 'ISO 2341 - B - 16 x 100DIN EN',
     'PSH24-000.02': 'PSH24-000.02-Variant2',
     'DIN 125 - A 17_1': 'Шайба DIN 125 - 17 - 200 HV HDG',
-    '\\X2\\04280430043904310430\\X0\\ DIN 127 - 7': 'Шайба DIN 127 - 7',
 }
 ALIAS_INV = {v: k for k, v in ALIAS.items()}
 
 def canonical(name):
-    """XCAF-имя -> имя дерева STEP (обозначение)."""
-    return ALIAS_INV.get(name, name)
+    r"""XCAF-имя -> имя дерева STEP (обозначение); \X2\...\X0\ декодируется."""
+    return ALIAS_INV.get(name) or decode_step(name)
 
 def geom_of(name):
     """Геометрия по обозначению (имя дерева STEP)."""
-    return GEOM.get(ALIAS.get(name, name), {})
+    return GEOM.get(ALIAS.get(name, name), GEOM.get(decode_step(name), {}))
 
 # ---------------- имена покупных изделий / аналоги ----------------
 STD = {
@@ -103,7 +128,7 @@ STD = {
     'DIN 125 - A 4,3':      ('Шайба плоская 4,3', 'ГОСТ 11371-78, исп. 1'),
     'DIN 125 - A 8,4':      ('Шайба плоская 8,4', 'ГОСТ 11371-78, исп. 1'),
     'DIN125  M6':           ('Шайба плоская 6', 'ГОСТ 11371-78, исп. 1'),
-    '\\X2\\04280430043904310430\\X0\\ DIN 127 - 7': ('Шайба пружинная 7', 'ГОСТ 6402-70'),
+    'Шайба DIN 127 - 7':     ('Шайба пружинная 7', 'ГОСТ 6402-70'),
     'DIN 929 M10':          ('Гайка приварная шестигранная М10', 'ГОСТ 14776-79, исп. 1'),
     'DIN 929 M16':          ('Гайка приварная шестигранная М16', 'ГОСТ 14776-79, исп. 1'),
     'DIN 929 M8':           ('Гайка приварная шестигранная М8', 'ГОСТ 14776-79, исп. 1'),

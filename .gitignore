@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+Комплект_КД_*.zip
+gen_drawings.log

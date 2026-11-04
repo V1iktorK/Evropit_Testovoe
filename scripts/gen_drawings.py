@@ -23,6 +23,8 @@ from OCP.TopAbs import TopAbs_FACE
 from OCP.TopoDS import TopoDS
 from OCP.BRepAdaptor import BRepAdaptor_Surface
 from OCP.GeomAbs import GeomAbs_Cylinder
+from OCP.BRepGProp import BRepGProp
+from OCP.GProp import GProp_GProps
 
 import glob as _glob
 
@@ -135,7 +137,12 @@ def filtered_shape(st, asm_label, max_mass_kg=0.25):
 
 # ------------------------------------------------------------------ отверстия
 def hole_groups(shape):
-    """Группы цилиндрических отверстий: [{d, axis, count, centers}] — по уникальным осям."""
+    """Группы цилиндрических отверстий: [{d, axis, count, centers}] — по уникальным осям.
+
+    Центр отверстия — проекция центра масс цилиндрической грани на её ось:
+    Location() геометрии цилиндра лежит на оси в произвольной точке (часто
+    далеко за пределами грани), из-за чего проекция уходила за рамку листа.
+    """
     holes = {}
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
@@ -148,13 +155,22 @@ def hole_groups(shape):
                 ax = cy.Axis().Direction()
                 v = (abs(ax.X()), abs(ax.Y()), abs(ax.Z()))
                 dom = v.index(max(v))
-                loc = cy.Location()
-                pos = [loc.X(), loc.Y(), loc.Z()]
+                # центр масс грани -> проекция на ось цилиндра
+                props = GProp_GProps()
+                BRepGProp.SurfaceProperties_s(f, props)
+                com = props.CentreOfMass()
+                loc = cy.Axis().Location()
+                t = ((com.X() - loc.X()) * ax.X() +
+                     (com.Y() - loc.Y()) * ax.Y() +
+                     (com.Z() - loc.Z()) * ax.Z())
+                pos = [loc.X() + t * ax.X(),
+                       loc.Y() + t * ax.Y(),
+                       loc.Z() + t * ax.Z()]
                 cross = tuple(round(pos[i], 1) for i in range(3) if i != dom)
                 key = (round(2 * r, 1), dom, cross)
                 if key not in holes:
                     holes[key] = dict(d=round(2 * r, 1), axis=dom,
-                                      center=(loc.X(), loc.Y(), loc.Z()))
+                                      center=tuple(pos))
         ex.Next()
     groups = {}
     for (d, dom, cross), info in holes.items():
@@ -223,6 +239,93 @@ def place_view(polys, ox, oy, s):
     x0, y0, x1, y1 = bbox2d(polys)
     return (x0 * s + ox, y0 * s + oy, x1 * s + ox, y1 * s + oy)
 
+# ------------------------------------------------------------------ вспомогательное
+def _fit(s, max_w, size):
+    """Обрезка строки под ширину max_w мм (≈0.62*size на знак)."""
+    if not s:
+        return s
+    if 0.62 * size * len(s) <= max_w:
+        return s
+    n = int(max_w / (0.62 * size))
+    return (s[:max(n - 1, 1)] + '…') if n >= 2 else s[:1]
+
+
+def _chain_segs(coords, min_len=7.0):
+    """Цепочка по координатам (на листе): слияние сегментов короче min_len."""
+    segs = []
+    for a, b in zip(coords, coords[1:]):
+        if b - a <= 1e-9:
+            continue
+        if segs and (segs[-1][1] - segs[-1][0]) < min_len:
+            segs[-1] = (segs[-1][0], b)
+        else:
+            segs.append((a, b))
+    if len(segs) > 1 and (segs[-1][1] - segs[-1][0]) < min_len:
+        a, b = segs.pop()
+        segs[-1] = (segs[-1][0], b)
+    return segs
+
+
+def _chain_groups(segs, s, fmt, text_size=3.0):
+    """Группировка одинаковых сегментов в 'N×L'; при нехватке места — поштучно."""
+    out = []
+    i = 0
+    while i < len(segs):
+        j = i
+        while j + 1 < len(segs) and abs((segs[j + 1][1] - segs[j + 1][0]) -
+                                        (segs[j][1] - segs[j][0])) < 0.3:
+            j += 1
+        n = j - i + 1
+        unit = (segs[i][1] - segs[i][0]) / s
+        x0, x1 = segs[i][0], segs[j][1]
+        if n == 1:
+            out.append((x0, x1, fmt(unit)))
+        else:
+            lab = f"{n}×{fmt(unit)}"
+            if 0.62 * text_size * len(lab) + 3 <= (x1 - x0):
+                out.append((x0, x1, lab))
+            else:
+                for k in range(i, j + 1):
+                    out.append((segs[k][0], segs[k][1],
+                                fmt((segs[k][1] - segs[k][0]) / s)))
+        i = j + 1
+    return out
+
+
+def _draw_chain(sheet, edge, edge_from, feats, line_pos, s, fmt,
+                horiz=True, text_size=3.0):
+    """Цепочка размеров от базовой грани до точек (координаты на листе).
+    edge - координата базовой грани; edge_from - вторая координата угла грани;
+    feats - [(координата точки, начало выносной линии)]."""
+    coords = sorted({round(c, 2) for c, _ in feats if c > edge + 0.5})
+    if not coords:
+        return
+    segs = _chain_segs([edge] + coords)
+    if not segs:
+        return
+    for (a, b, lab) in _chain_groups(segs, s, fmt, text_size):
+        p1 = (a, line_pos) if horiz else (line_pos, a)
+        p2 = (b, line_pos) if horiz else (line_pos, b)
+        sheet.dim_linear(p1, p2, 0, text=lab, text_size=text_size)
+    # выносные линии от точек к цепочке
+    for c, st in feats:
+        if abs(c - edge) < 0.5:
+            continue
+        if horiz:
+            sheet.line((c, st), (c, line_pos + 1), col='dim', lw='thin')
+        else:
+            sheet.line((st, c), (line_pos - 1, c), col='dim', lw='thin')
+    # продолжение базовой грани до цепочки
+    if horiz:
+        sheet.line((edge, edge_from), (edge, line_pos + 1), col='dim', lw='thin')
+    else:
+        sheet.line((edge_from, edge), (line_pos - 1, edge), col='dim', lw='thin')
+
+
+def _rect_in(r, x, y, pad=0.0):
+    return (r[0] - pad <= x <= r[2] + pad) and (r[1] - pad <= y <= r[3] + pad)
+
+
 # ------------------------------------------------------------------ чертёж детали
 def make_part_drawing(name, shape):
     kind = D.part_kind(name)
@@ -247,118 +350,177 @@ def make_part_drawing(name, shape):
     for key, da, ua in views:
         v, h = hlr_view(shape, AXV[da], AXV[ua])
         proj[key] = (v, h)
-    # изометрия — смотрим по диагонали так, чтобы длинная ось была горизонтальна
+    # изометрия — длинная ось горизонтальна
     hv, vv, dv = AXV[h_ax], AXV[v_ax], AXV[d_ax]
     iso_dir = tuple(-(0.8 * hv[i] + 1.0 * dv[i] + 0.62 * vv[i]) for i in range(3))
     iso_v, _ = hlr_view(shape, iso_dir, vv)
-
-    gap = 18
-    bb = {k: bbox2d(v) for k, (v, h) in proj.items()}
-    bb['iso'] = bbox2d(iso_v)
-    w_main = bb['main'][2] - bb['main'][0]
-    h_main = bb['main'][3] - bb['main'][1]
-    h_top = bb['top'][3] - bb['top'][1]
-    w_left = bb['left'][2] - bb['left'][0]
-    h_left = bb['left'][3] - bb['left'][1]
-    w_iso = bb['iso'][2] - bb['iso'][0]
-    h_iso = bb['iso'][3] - bb['iso'][1]
-    total_w = w_main + gap + max(w_left, w_iso)
-    total_h = h_main + gap + max(h_top, h_iso)
 
     sheet = Sheet('A3', True, designation=name, name=D.part_name(name),
                   material=D.part_material_ru(name).split(' (')[0],
                   mass=f"{D.part_mass_kg(name):.2f} кг", scale_text='')
     ax0, ay0, ax1, ay1 = sheet.frame_inner
-    # поле видов: верхняя часть листа на всю ширину; нижняя часть — под ТТ
-    notes_top = ay0 + 62
-    aw = (ax1 - ax0) - 24
-    ah = (ay1 - notes_top) - 14
-    s, s_text = pick_scale(total_w, total_h, aw, ah)
-    sheet.scale_text = s_text
+    # поле чертежа (без зоны ТТ внизу)
+    fx0, fy0, fx1, fy1 = ax0 + 26, ay0 + 76, ax1 - 6, ay1 - 18
+    FW, FH = fx1 - fx0, fy1 - fy0
 
-    fmt = lambda val: f"{val:.1f}".rstrip('0').rstrip('.') if abs(val - round(val)) > 0.05 else f"{int(round(val))}"
+    fmt = lambda val: (f"{val:.1f}".rstrip('0').rstrip('.')
+                       if abs(val - round(val)) > 0.05 else f"{int(round(val))}")
 
-    # размещение видов (выравнивание по верхней границе)
-    top_y = ay1 - 12
-    ox = ax0 + 24 - bb['main'][0] * s
-    oy = top_y - bb['main'][3] * s
-    main_bottom = oy + bb['main'][1] * s
-    origins = {
-        'main': (ox, oy),
-        'top': (ox, (main_bottom - gap * s) - bb['top'][3] * s),
-        'left': (ox + (w_main + gap) * s - bb['left'][0] * s, top_y - bb['left'][3] * s),
-    }
+    bb = {k: bbox2d(v) for k, (v, h) in proj.items()}
+    bb['iso'] = bbox2d(iso_v)
+    wm, hm = bb['main'][2] - bb['main'][0], bb['main'][3] - bb['main'][1]
+    wt, ht = bb['top'][2] - bb['top'][0], bb['top'][3] - bb['top'][1]
+    ws, hs = bb['left'][2] - bb['left'][0], bb['left'][3] - bb['left'][1]
+    wi, hi = bb['iso'][2] - bb['iso'][0], bb['iso'][3] - bb['iso'][1]
 
-    for key, da, ua in views:
+    # ---- подбор масштаба (проверка размещения всех видов) ----
+    place = None
+    for den in (1, 2, 5, 10, 20, 50, 100):
+        s = 1.0 / den
+        Wm, Hm = wm * s, hm * s
+        Ws, Hs = ws * s, hs * s
+        Ht = ht * s
+        if 19 + Wm + 26 + max(Ws, 4) > FW:      # поле слева + главный + зазор под Y-цепочку + боковой
+            continue
+        if 17 + Hm + 26 + 2 + Ht > FH:          # размер сверху + главный + цепочка + верхний
+            continue
+        mx0 = fx0 + 19
+        my1 = fy1 - 17
+        my0 = my1 - Hm
+        if my0 - 26 - Ht < fy0 + 2:
+            continue
+        place = (den, s, mx0, my0, my1, Wm, Hm, Ws, Hs, Ht)
+        break
+    if place is None:                            # запасной вариант
+        den = 100
+        s = 0.01
+        Wm, Hm, Ws, Hs, Ht = wm * s, hm * s, ws * s, hs * s, ht * s
+        mx0 = fx0 + 19
+        my1 = fy1 - 17
+        my0 = my1 - Hm
+    den, s, mx0, my0, my1, Wm, Hm, Ws, Hs, Ht = place or (
+        den, s, mx0, my0, my1, Wm, Hm, Ws, Hs, Ht)
+    sheet.scale_text = f"1:{den}" if den >= 1 else f"{den}:1"
+    mx1 = mx0 + Wm
+
+    # ---- размещение видов ----
+    origins = {'main': (mx0 - bb['main'][0] * s, my0 - bb['main'][1] * s)}
+    ty1 = my0 - 26
+    origins['top'] = (mx0 - bb['top'][0] * s, ty1 - bb['top'][3] * s)
+    sx0 = mx1 + 26
+    origins['left'] = (sx0 - bb['left'][0] * s, my1 - bb['left'][3] * s)
+
+    for key in ('main', 'top', 'left'):
         v, h = proj[key]
         tx, ty = origins[key]
         draw_polys(sheet, v, tx, ty, s, 'outline', 'thick')
         draw_polys(sheet, h, tx, ty, s, 'hidden', 'thin', 'hidden')
         proj[key] = (v, h, tx, ty, place_view(v, tx, ty, s))
 
-    iso_x = ox + (w_main + gap) * s - bb['iso'][0] * s
-    iso_y = (main_bottom - gap * s) - bb['iso'][3] * s
-    draw_polys(sheet, iso_v, iso_x, iso_y, s, 'outline', 'thin')
-    sheet.text((iso_x + w_iso * s + 8, iso_y + bb['iso'][1] * s + 4), 'Вид изометрический',
-               size=3.5, col='text')
+    # ---- изометрия: первая свободная зона ----
+    ty0 = ty1 - Ht
+    zones = [
+        (mx1 + 26, ty1),                    # справа-снизу (под боковым видом)
+        (sx0 + max(Ws, 4) + 10, my1),       # справа от бокового вида
+        (fx0, ty0),                         # под видом сверху, во всю ширину поля
+    ]
+    iso_rect = None
+    for cand_s in (s, s / 2, s / 4, s / 5, s / 10):
+        Wi, Hi = wi * cand_s, hi * cand_s
+        for zx, ztop in zones:
+            if zx + Wi <= fx1 and ztop - Hi >= fy0:
+                iso_rect = (zx, ztop - Hi, zx + Wi, ztop)
+                iso_s = cand_s
+                break
+        if iso_rect:
+            break
+    if iso_rect:
+        iso_lbl = ('Вид изометрический' if abs(iso_s - s) < 1e-9 else
+                   f"Вид изометрический (1:{int(round(1 / iso_s))})")
+        ox = iso_rect[0] - bb['iso'][0] * iso_s
+        oy = iso_rect[3] - bb['iso'][3] * iso_s
+        draw_polys(sheet, iso_v, ox, oy, iso_s, 'outline', 'thin')
+        lw_ = 0.62 * 3.5 * len(iso_lbl)
+        if iso_rect[2] + 6 + lw_ <= fx1:
+            sheet.text((iso_rect[2] + 6, iso_rect[1] + 4), iso_lbl,
+                       size=3.5, col='text')
+        elif iso_rect[0] - 6 - lw_ >= fx0:
+            sheet.text((iso_rect[0] - 6, iso_rect[1] + 4), iso_lbl,
+                       size=3.5, ha='right', col='text')
+        elif iso_rect[1] - 5 >= fy0:
+            sheet.text((iso_rect[0], iso_rect[1] - 5), iso_lbl,
+                       size=3.5, col='text')
+        else:
+            sheet.text((iso_rect[0], iso_rect[3] + 5), iso_lbl,
+                       size=3.5, col='text')
 
-    # ---- размеры (значения в мм модели) ----
-    v, h, tx, ty, (x0, y0, x1, y1) = proj['main']
-    sheet.dim_linear((x0, y0), (x1, y0), -10, text=fmt(axes[h_ax]))
-    sheet.dim_linear((x0, y0), (x0, y1), -10, text=fmt(axes[v_ax]))
-    v2, h2, tx2, ty2, (a0, b0, a1, b1) = proj['top']
-    sheet.dim_linear((a1, b0), (a1, b1), 10, text=fmt(axes[d_ax]))
-    v3, h3, tx3, ty3, (c0, d0, c1, d1) = proj['left']
-    sheet.dim_linear((c0, d0), (c1, d0), -10, text=fmt(axes[d_ax]))
+    # ---- размеры главного вида ----
+    x0, y0, x1, y1 = proj['main'][4]
+    sheet.dim_linear((x0, y1), (x1, y1), 12, text=fmt(axes[h_ax]))
+    sheet.dim_linear((x0, y0), (x0, y1), 14, text=fmt(axes[v_ax]))
+    # глубина - на виде сверху (слева)
+    a0, b0, a1, b1 = proj['top'][4]
+    sheet.dim_linear((a0, b0), (a0, b1), 10, text=fmt(axes[d_ax]))
 
     # ---- отверстия ----
-    holes = [hg for hg in hole_groups(shape) if hg['axis'] == AXI[d_ax]]
-    note = []
-    for hg in sorted(holes, key=lambda hg: -hg['d']):
-        note.append(f"Ø{hg['d']:g} — {hg['count']} шт.")
+    all_holes = hole_groups(shape)
+    holes = [hg for hg in all_holes if hg['axis'] == AXI[d_ax]]
+    agg = {}
+    for hg in all_holes:
+        agg[hg['d']] = agg.get(hg['d'], 0) + hg['count']
+    note = [f"Ø{d:g} — {c} шт." for d, c in sorted(agg.items(), key=lambda kv: -kv[0])]
+    if note:
+        sheet.text((ax0 + 5, ay0 + 68),
+                   _fit('Отверстия: ' + '; '.join(note[:8]), ax1 - ax0 - 12, 3.2),
+                   size=3.2, col='note')
     if holes:
-        big_hole = max(holes, key=lambda hg: hg['d'])
-        c = big_hole['centers'][0]
-        vx, vy = view_project(c, AXV[d_ax], AXV[v_ax])
-        px = vx * s + tx
-        py = vy * s + ty
-        sheet.dim_diameter((px, py), big_hole['d'] / 2 * s, 55,
-                           text=f"{big_hole['count']}×Ø{big_hole['d']:g}" if big_hole['count'] > 1
-                           else f"Ø{big_hole['d']:g}")
-        sheet.text((ax0 + 5, ay0 + 68), 'Отверстия: ' + '; '.join(note[:8]), size=3.2, col='note')
-
-        # центровые оси и размеры положения отверстий
-        centers_all = []
+        tx_, ty_ = origins['main']
+        feats = []
         for hg in holes:
             for c in hg['centers']:
                 vx, vy = view_project(c, AXV[d_ax], AXV[v_ax])
-                centers_all.append((vx * s + tx, vy * s + ty, hg['d'] / 2 * s))
-        for (cx_, cy_, r_) in centers_all:
+                feats.append((vx * s + tx_, vy * s + ty_,
+                              hg['d'] / 2 * s))
+        # центровые оси (концы не выходят за рамку листа)
+        L, B, R, T = ax0 + 0.5, ay0 + 0.5, ax1 - 0.5, ay1 - 0.5
+        for (cx_, cy_, r_) in feats:
             m = max(r_ + 1.5, 2.0)
-            sheet.line((cx_ - m, cy_), (cx_ + m, cy_), col='center', lw='hair', dash='center')
-            sheet.line((cx_, cy_ - m), (cx_, cy_ + m), col='center', lw='hair', dash='center')
-        # цепочки размеров по строкам (одинаковые y) — только 2 основных ряда,
-        # чтобы не перегружать чертёж
-        rows_y = {}
-        for (cx_, cy_, r_) in centers_all:
-            key = round(cy_, 0)
-            rows_y.setdefault(key, []).append(cx_)
-        rows_sorted = sorted(rows_y.items(), key=lambda kv: -len(kv[1]))[:2]
-        for ri, (key, xs) in enumerate(sorted(rows_sorted, key=lambda kv: kv[0])):
-            xs = sorted(xs)
-            if len(xs) < 2:
-                continue
-            off = -20 - ri * 11
-            for a, b in zip(xs, xs[1:]):
-                sheet.dim_linear((a, key), (b, key), off, text=fmt((b - a) / s))
-            # размер от левого края вида до первого отверстия
-            sheet.dim_linear((x0, key), (xs[0], key), off, text=fmt((xs[0] - x0) / s))
+            if B <= cy_ <= T and cx_ - m < cx_ + m:
+                sheet.line((max(L, cx_ - m), cy_), (min(R, cx_ + m), cy_),
+                           col='center', lw='hair', dash='center')
+            if L <= cx_ <= R and cy_ - m < cy_ + m:
+                sheet.line((cx_, max(B, cy_ - m)), (cx_, min(T, cy_ + m)),
+                           col='center', lw='hair', dash='center')
+        # цепочка X (под главным видом) и Y (справа от главного вида),
+        # замкнутая на дальнюю грань вида — суммы сходятся с общими размерами
+        _draw_chain(sheet, x0, y0,
+                    [(fx, cy - r_ - 2) for fx, cy, r_ in feats] + [(x1, y0)],
+                    y0 - 16, s, fmt, horiz=True)
+        _draw_chain(sheet, y0, x1,
+                    [(fy, cx + r_ + 2) for cx, fy, r_ in feats] + [(y1, x1)],
+                    x1 + 16, s, fmt, horiz=False)
+        # вызовный размер на самое крупное отверстие
+        big = max(holes, key=lambda hg: hg['d'])
+        c = big['centers'][0]
+        vx, vy = view_project(c, AXV[d_ax], AXV[v_ax])
+        px, py = vx * s + tx_, vy * s + ty_
+        txt = (f"{big['count']}×Ø{big['d']:g}" if big['count'] > 1
+               else f"Ø{big['d']:g}")
+        if py < y1 - 25:
+            right = px < (fx0 + fx1) / 2
+            ang = 45 if right else 135
+        else:  # у верхнего края — горизонтальная полка внутрь вида
+            right = px < fx1 - 60
+            ang = 0 if right else 180
+        sheet.dim_diameter((px, py), big['d'] / 2 * s, ang, text=txt,
+                           shelf_dir=1 if right else -1)
 
     # ---- технические требования ----
     yy = ay0 + 58
     sheet.text((ax0 + 5, yy), 'Технические требования:', size=3.5, col='text')
     for i, t in enumerate(TECH.get(kind, TECH['other'])):
-        sheet.text((ax0 + 5, yy - 6 - i * 5), t, size=3.0, col='text')
+        sheet.text((ax0 + 5, yy - 6 - i * 5), _fit(t, ax1 - 185 - ax0 - 10, 3.0),
+                   size=3.0, col='text')
     return sheet
 
 # ------------------------------------------------------------------ сборочный чертёж
@@ -386,11 +548,11 @@ def make_asm_drawing(st, name):
             continue
         pos_list.append((i, ch, q, c))
 
-    row_h = 5.0
+    row_h, col_w = 5.0, 132
     n = max(len(pos_list), 1)
     ncols = 2 if n > 28 else 1
     per_col = (n + ncols - 1) // ncols
-    table_h = per_col * row_h + 16
+    table_top = ay0 + 8 + per_col * row_h + 8
 
     v, h = hlr_view(hlr_shape, (0, -1, 0), (0, 0, 1), with_hidden=False)
     v2, h2 = hlr_view(hlr_shape, (1, 0, 0), (0, 0, 1), with_hidden=False)
@@ -398,57 +560,133 @@ def make_asm_drawing(st, name):
     iso_dir = tuple(-(0.8 * hv[i] + 1.0 * dv[i] + 0.62 * vv[i]) for i in range(3))
     iso_v, _ = hlr_view(hlr_shape, iso_dir, vv, with_hidden=False)
     bb1, bb2, bbi = bbox2d(v), bbox2d(v2), bbox2d(iso_v)
-    gap = 20
     w1, h1 = bb1[2] - bb1[0], bb1[3] - bb1[1]
     w2, h2b = bb2[2] - bb2[0], bb2[3] - bb2[1]
     wi, hi = bbi[2] - bbi[0], bbi[3] - bbi[1]
-    total_w = w1 + gap + max(w2, wi)
-    total_h = h1 + gap + max(h2b, hi)
 
-    aw = (ax1 - ax0) - 24
-    ah = (ay1 - ay0) - table_h - 24
-    s, s_text = pick_scale(total_w, total_h, aw, ah)
-    sheet.scale_text = s_text
-    ox = ax0 + 24 - bb1[0] * s
-    top_y = ay1 - 12
-    oy1 = top_y - bb1[3] * s
-    draw_polys(sheet, v, ox, oy1, s, 'outline', 'thick')
-    draw_polys(sheet, h, ox, oy1, s, 'hidden', 'thin', 'hidden')
-    ox2 = ox + (w1 + gap) * s - bb2[0] * s
-    oy2 = top_y - bb2[3] * s
+    # область видов (над таблицей и ТТ)
+    RX0, RX1 = ax0 + 8, ax1 - 6
+    RY0 = max(table_top + 6, ay0 + 114)
+    RY1 = ay1 - 10
+
+    # ---- подбор масштаба с проверкой размещения ----
+    den, s, front, side, iso_zone, iso_sc = None, None, None, None, None, None
+    for cand in (1, 2, 5, 10, 20, 50, 100):
+        sc = 1.0 / cand
+        W1, H1 = w1 * sc, h1 * sc
+        W2, H2 = w2 * sc, h2b * sc
+        if H1 > RY1 - RY0 - 2:
+            continue
+        if RX0 + 4 + W1 + 16 + W2 > RX1:
+            continue
+        f = (RX0 + 4, RY1 - H1, RX0 + 4 + W1, RY1)
+        sd = (f[2] + 16, RY1 - H2, f[2] + 16 + W2, RY1)
+        zone, isc = None, None
+        for ksc in (sc, sc / 2):                      # изометрия целиком или вполовину
+            Wi, Hi = wi * ksc, hi * ksc
+            for zx, ztop in ((sd[2] + 16, RY1), (RX0 + 4, f[1] - 16)):
+                if zx + Wi <= RX1 and ztop - Hi >= RY0:
+                    zone = (zx, ztop - Hi, zx + Wi, ztop)
+                    isc = ksc
+                    break
+            if zone:
+                break
+        den, s, front, side, iso_zone, iso_sc = cand, sc, f, sd, zone, isc
+        break
+    if den is None:                                  # запасной вариант
+        den, s = 100, 0.01
+        W1, H1, W2, H2 = w1 * s, h1 * s, w2 * s, h2b * s
+        front = (RX0 + 4, RY1 - H1, RX0 + 4 + W1, RY1)
+        side = (front[2] + 16, RY1 - H2, front[2] + 16 + W2, RY1)
+        iso_zone, iso_sc = None, None
+    sheet.scale_text = f"1:{den}"
+
+    # ---- виды ----
+    ox = front[0] - bb1[0] * s
+    oy = front[1] - bb1[1] * s
+    draw_polys(sheet, v, ox, oy, s, 'outline', 'thick')
+    draw_polys(sheet, h, ox, oy, s, 'hidden', 'thin', 'hidden')
+    ox2 = side[0] - bb2[0] * s
+    oy2 = side[1] - bb2[1] * s
     draw_polys(sheet, v2, ox2, oy2, s, 'outline', 'thick')
     draw_polys(sheet, h2, ox2, oy2, s, 'hidden', 'thin', 'hidden')
-    main_bottom = oy1 + bb1[1] * s
-    oxi = ox + (w1 + gap) * s - bbi[0] * s
-    oyi = (main_bottom - gap * s) - bbi[3] * s
-    draw_polys(sheet, iso_v, oxi, oyi, s, 'outline', 'thin')
+    if iso_zone:
+        oxi = iso_zone[0] - bbi[0] * iso_sc
+        oyi = iso_zone[1] - bbi[1] * iso_sc
+        draw_polys(sheet, iso_v, oxi, oyi, iso_sc, 'outline', 'thin')
+        lbl = 'Вид изометрический'
+        if iso_sc < s:
+            lbl += f" (1:{int(round(1 / iso_sc))})"
+        lw_ = 0.62 * 3.5 * len(lbl)
+        if iso_zone[2] + 6 + lw_ <= RX1:
+            sheet.text((iso_zone[2] + 6, iso_zone[1] + 4), lbl, size=3.5)
+        elif iso_zone[0] - 6 - lw_ >= RX0:
+            sheet.text((iso_zone[0] - 6, iso_zone[1] + 4), lbl, size=3.5, ha='right')
+        elif iso_zone[1] - 5 >= RY0:
+            sheet.text((iso_zone[0], iso_zone[1] - 5), lbl, size=3.5)
+        else:
+            sheet.text((iso_zone[0], iso_zone[3] + 5), lbl, size=3.5)
 
-    # позиции на главном виде — радиально от центра вида, со сдвигом
-    cx_view, cy_view = (bb1[0] + bb1[2]) / 2 * s + ox, (bb1[1] + bb1[3]) / 2 * s + oy1
-    for k, (i, ch, q, c) in enumerate(pos_list):
-        vx, vy = view_project(c, (0, -1, 0), (0, 0, 1))  # главный вид
-        px, py = vx * s + ox, vy * s + oy1
-        dx_, dy_ = px - cx_view, py - cy_view
-        L = math.hypot(dx_, dy_) or 1.0
-        rr = 16 + (k % 3) * 7
-        bx, by = px + dx_ / L * rr, py + dy_ / L * rr
-        sheet.circle((bx, by), 3.2, col='dim', lw='thin')
-        sheet.text((bx, by), str(i), size=3.2, ha='center', col='dim')
-        sheet.line((bx + (px - bx) * 0.22, by + (py - by) * 0.22), (px, py), col='dim', lw='thin')
-
-    # таблица состава — слева внизу (1-2 колонки)
+    # ---- выноски-позиции (радиально, без наложений) ----
     tx0, ty0 = ax0 + 5, ay0 + 8
-    ncols = 2 if n > 28 else 1
-    per_col = (n + ncols - 1) // ncols
-    col_w = 132
-    sheet.text((tx0, ty0 + per_col * row_h + 6), 'Состав сборки:', size=3.5)
-    hdrs = ['Поз', 'Обозначение', 'Наименование', 'Кол.']
+    tbl_rect = (tx0 - 3, ay0 + 4, tx0 + ncols * (col_w + 6) - 9, table_top + 3)
+    tt_rect = (ax1 - 194, ay0 + 76, ax1 - 4, ay0 + 123)
+    tb_rect = (ax1 - 185, ay0, ax1, ay0 + 55)
+    forbidden = [tbl_rect, tt_rect, tb_rect, side]
+    if iso_zone:
+        forbidden.append(iso_zone)
+    cxv = (front[0] + front[2]) / 2
+    cyv = (front[1] + front[3]) / 2
+    used = []
+    for (i, ch, q, c) in pos_list:
+        vx, vy = view_project(c, (0, -1, 0), (0, 0, 1))
+        px, py = vx * s + ox, vy * s + oy
+        dx_, dy_ = px - cxv, py - cyv
+        base = (math.atan2(dy_, dx_)
+                if math.hypot(dx_, dy_) > 1e-6 else math.radians(45))
+        ball = None
+        for require_out in (True, False):     # сначала вне главного вида, потом внутри
+            for rr in (9, 14, 20, 27, 35, 44, 54, 66, 80):
+                for dang in (0, 12, -12, 24, -24, 38, -38, 55, -55, 75, -75):
+                    a = base + math.radians(dang)
+                    bx, by = px + rr * math.cos(a), py + rr * math.sin(a)
+                    if not (ax0 + 6 <= bx <= ax1 - 6 and ay0 + 6 <= by <= ay1 - 6):
+                        continue
+                    if any(_rect_in(r, bx, by, 1.5) for r in forbidden):
+                        continue
+                    if any(math.hypot(bx - ux, by - uy) < 9 for ux, uy in used):
+                        continue
+                    if math.hypot(bx - px, by - py) < 6:
+                        continue
+                    if require_out and _rect_in(front, bx, by, 1):
+                        continue
+                    ball = (bx, by)
+                    break
+                if ball:
+                    break
+            if ball:
+                break
+        if not ball:
+            continue
+        used.append(ball)
+        sheet.circle(ball, 3.2, col='dim', lw='thin')
+        sheet.text(ball, str(i), size=3.2, ha='center', col='dim')
+        ux, uy = px - ball[0], py - ball[1]
+        d = math.hypot(ux, uy) or 1.0
+        sheet.line((ball[0] + ux / d * 3.6, ball[1] + uy / d * 3.6),
+                   (px, py), col='dim', lw='thin')
+        sheet.circle((px, py), 0.7, col='dim', lw='thin')
+
+    # ---- таблица состава ----
+    sheet.text((tx0, table_top - 2), 'Состав сборки:', size=3.5)
+    hdrs = ['Поз.', 'Обозначение', 'Наименование', 'Кол.']
     for cnum in range(ncols):
         base_x = tx0 + cnum * (col_w + 6)
         colx = [base_x, base_x + 10, base_x + 52, base_x + 122]
         for cx, htxt in zip(colx, hdrs):
             sheet.text((cx + 1, ty0 + per_col * row_h + 1.5), htxt, size=2.8)
-        sheet.line((base_x, ty0 + per_col * row_h - 1), (base_x + col_w, ty0 + per_col * row_h - 1),
+        sheet.line((base_x, ty0 + per_col * row_h - 1),
+                   (base_x + col_w, ty0 + per_col * row_h - 1),
                    col='thin', lw='thin')
         for k in range(per_col):
             idx = cnum * per_col + k
@@ -457,16 +695,18 @@ def make_asm_drawing(st, name):
             i, ch, q, c = pos_list[idx]
             y = ty0 + (per_col - 1 - k) * row_h
             sheet.text((colx[0] + 2, y), str(i), size=2.8)
-            sheet.text((colx[1] + 1, y), ch, size=2.8)
-            sheet.text((colx[2] + 1, y), D.part_name(ch)[:38], size=2.8)
+            sheet.text((colx[1] + 1, y), _fit(ch, 40, 2.8), size=2.8)
+            sheet.text((colx[2] + 1, y), _fit(D.part_name(ch), 67, 2.8), size=2.8)
             sheet.text((colx[3] + 1, y), str(q), size=2.8)
-            sheet.line((base_x, y - 2.4), (base_x + col_w, y - 2.4), col='thin', lw='thin')
+            sheet.line((base_x, y - 2.4), (base_x + col_w, y - 2.4),
+                       col='thin', lw='thin')
 
-    # ТТ — справа над основной надписью
-    yy = ay0 + 92
-    sheet.text((ax1 - 185, yy), 'Технические требования:', size=3.5, col='text')
+    # ---- ТТ — справа над основной надписью ----
+    yy = ay0 + 112
+    sheet.text((ax1 - 190, yy), 'Технические требования:', size=3.5, col='text')
     for i, t in enumerate(TECH['assembly']):
-        sheet.text((ax1 - 185, yy - 6 - i * 5), t, size=3.0, col='text')
+        sheet.text((ax1 - 190, yy - 6 - i * 5), _fit(t, 186, 3.0),
+                   size=3.0, col='text')
     return sheet
 
 # ------------------------------------------------------------------ main
